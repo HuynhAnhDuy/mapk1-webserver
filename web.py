@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from rdkit import Chem
+from rdkit import Chem, DataStructs
+from rdkit.Chem import AllChem
 from joblib import load
 import torch
 import torch.nn as nn
@@ -236,6 +237,128 @@ res = load_resources()
 
 
 # =========================
+# Applicability Domain (AD)
+# =========================
+@st.cache_resource
+def load_ad_resources():
+    """Load the precomputed AD reference fingerprints and parameters once."""
+    ad_data = load("AD_seed111_k100.joblib")
+
+    required = {
+        "fingerprints", "radius", "bits", "k",
+        "dk", "sk", "z", "threshold"
+    }
+    missing = required.difference(ad_data.keys())
+    if missing:
+        raise ValueError(
+            f"AD joblib is missing required fields: {sorted(missing)}"
+        )
+
+    if ad_data["radius"] != 10 or ad_data["bits"] != 4096:
+        raise ValueError(
+            "AD fingerprint settings do not match the expected ECFP "
+            "(radius=10, bits=4096)."
+        )
+
+    # Fingerprints are stored using RDKit's internal ExplicitBitVect
+    # binary serialization. Restore each vector, then convert it to a
+    # fixed-length packed bit representation for distance calculations.
+    fingerprint_bytes = ad_data["fingerprints"]
+
+    if not fingerprint_bytes:
+        raise ValueError("No reference fingerprints were found in the AD file.")
+
+    expected_bytes = (ad_data["bits"] + 7) // 8
+    packed_fingerprints = []
+
+    for binary_fp in fingerprint_bytes:
+        restored_fp = DataStructs.ExplicitBitVect(binary_fp)
+        if restored_fp.GetNumBits() != ad_data["bits"]:
+            raise ValueError("Unexpected fingerprint size in AD joblib.")
+
+        packed_fp = DataStructs.BitVectToBinaryText(restored_fp)
+        packed_fingerprints.append(
+            np.frombuffer(packed_fp, dtype=np.uint8)
+        )
+
+    reference_matrix = np.vstack(packed_fingerprints)
+    if reference_matrix.shape[1] != expected_bytes:
+        raise ValueError("Unexpected packed fingerprint size in AD joblib.")
+
+    # Lookup table for fast bit counts (population count).
+    popcount_lut = np.array(
+        [bin(i).count("1") for i in range(256)],
+        dtype=np.uint8
+    )
+
+    return {
+        "reference_matrix": reference_matrix,
+        "popcount_lut": popcount_lut,
+        "radius": int(ad_data["radius"]),
+        "bits": int(ad_data["bits"]),
+        "k": int(ad_data["k"]),
+        "dk": float(ad_data["dk"]),
+        "sk": float(ad_data["sk"]),
+        "z": float(ad_data["z"]),
+        "threshold": float(ad_data["threshold"])
+    }
+
+
+def predict_ad(smiles):
+    """
+    Assess whether a query molecule is within the AD.
+    Euclidean distance between binary fingerprints is calculated as
+    sqrt(Hamming distance).
+    """
+    ad = load_ad_resources()
+
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError("Invalid SMILES for AD assessment.")
+
+    query_fp = AllChem.GetMorganFingerprintAsBitVect(
+        mol,
+        radius=ad["radius"],
+        nBits=ad["bits"]
+    )
+    query_bytes = DataStructs.BitVectToBinaryText(query_fp)
+    query_vector = np.frombuffer(query_bytes, dtype=np.uint8)
+
+    # Calculate squared Euclidean distances for binary vectors.
+    xor_matrix = np.bitwise_xor(
+        ad["reference_matrix"],
+        query_vector[np.newaxis, :]
+    )
+    hamming_distances = ad["popcount_lut"][xor_matrix].sum(axis=1)
+
+    k = ad["k"]
+    if len(hamming_distances) < k:
+        raise ValueError(
+            f"AD reference set contains fewer than {k} fingerprints."
+        )
+
+    # Mean Euclidean distance to the k nearest reference molecules.
+    nearest_squared_distances = np.partition(
+        hamming_distances, k - 1
+    )[:k]
+    mean_knn_distance = float(np.sqrt(nearest_squared_distances).mean())
+
+    status = (
+        "Within-domain"
+        if mean_knn_distance <= ad["threshold"]
+        else "Outside-domain (OOD)"
+    )
+
+    return {
+        "status": status,
+        "mean_distance": mean_knn_distance,
+        "threshold": ad["threshold"]
+    }
+
+
+
+
+# =========================
 # Graph encoder (RDKit → PyTorch Geometric)
 # =========================
 def atom_features(atom):
@@ -459,6 +582,25 @@ with tab1:
         st.write("**ConsensusGNN Output**")
         st.write(f"{consensus_prob:.4f}")
 
+        # Additional AD assessment; does not alter prediction outputs.
+        st.markdown("##### Applicability Domain (AD)")
+        try:
+            ad_result = predict_ad(st.session_state["last_smiles"])
+            if ad_result["status"] == "Within-domain":
+                st.success("Within-domain")
+            else:
+                st.warning("Outside-domain (OOD)")
+
+            st.write(
+                f"Mean Euclidean distance (k={load_ad_resources()['k']}): "
+                f"{ad_result['mean_distance']:.4f}"
+            )
+            st.write(
+                f"AD threshold: {ad_result['threshold']:.4f}"
+            )
+        except Exception as exc:
+            st.error(f"AD assessment could not be completed: {exc}")
+
         st.markdown(
             "**Prediction Interpretation:**  \n"
             "All models agree > 0.5 → Active  \n"
@@ -500,6 +642,8 @@ with tab2:
         gnn_preds = []
         attfp_preds = []
         consensus_probs = []
+        ad_statuses = []
+        ad_distances = []
 
         for smiles in df["SMILES"]:
             result = predict_full_system(smiles)
@@ -510,18 +654,30 @@ with tab2:
                 gnn_preds.append(stack[0][1])
                 attfp_preds.append(stack[0][2])
                 consensus_probs.append(cprob)
+
+                try:
+                    ad_result = predict_ad(smiles)
+                    ad_statuses.append(ad_result["status"])
+                    ad_distances.append(ad_result["mean_distance"])
+                except Exception:
+                    ad_statuses.append("AD assessment error")
+                    ad_distances.append(None)
             else:
                 final_preds.append(None)
                 gcnn_preds.append(None)
                 gnn_preds.append(None)
                 attfp_preds.append(None)
                 consensus_probs.append(None)
+                ad_statuses.append("Invalid SMILES")
+                ad_distances.append(None)
 
         df["AttentiveFP_Prob"] = attfp_preds
         df["GCNN_Prob"] = gcnn_preds
         df["GMNN_Prob"] = gnn_preds
         df["StackGNN_LR_Prob"] = final_preds
         df["ConsensusGNN_Prob"] = consensus_probs
+        df["AD_Status"] = ad_statuses
+        df["AD_Mean_Euclidean_Distance"] = ad_distances
 
         # Compute consensus
         consensuses = []
